@@ -16,6 +16,7 @@ type User struct {
 type Config struct {
 	Key        string
 	Value      *string
+	Default    *string
 	Changeable bool
 }
 
@@ -27,10 +28,13 @@ type Database struct {
 	Database           string
 	ForceUser          *string
 	PoolSize           int
+	MinPoolSize        int
 	ReservePool        int
 	PoolMode           *string
 	MaxConnections     int
 	CurrentConnections int
+	Paused             int
+	Disabled           int
 }
 
 // Pool as returned by PGBouncer's SHOW POOLS
@@ -39,12 +43,17 @@ type Pool struct {
 	User      string
 	ClActive  int
 	ClWaiting int
+	ClActiveCancelReq int
+	ClWaitingCancelReq int
 	SvActive  int
+	SvActiveCancel int
+	SvBeingCanceled int
 	SvIdle    int
 	SvUsed    int
 	SvTested  int
 	SvLogin   int
 	MaxWait   int
+	MaxwaitUs int
 	PoolMode  string
 }
 
@@ -60,10 +69,15 @@ type Client struct {
 	LocalPort   int
 	ConnectTime string
 	RequestTime string
+	Wait		int
+	WaitUs		int
+	CloseNeeded int
 	Ptr         string
 	Link        string
 	RemotePid   int
 	TLS         string
+	ApplicationName  *string
+	PreparedStatements  int
 }
 
 // Server as returned by PGBouncer's SHOW SERVERS
@@ -78,10 +92,15 @@ type Server struct {
 	LocalPort   int
 	ConnectTime string
 	RequestTime string
+	Wait		int
+	WaitUs		int
+	CloseNeeded int
 	Ptr         string
 	Link        string
 	RemotePid   int
 	TLS         string
+	ApplicationName  *string
+	PreparedStatements  int
 }
 
 // Mem info record as returned by PGBouncer's SHOW MEM
@@ -95,15 +114,21 @@ type Mem struct {
 
 // Stat  record as returned by PGBouncer's SHOW STAT
 type Stat struct {
-	Database       string
-	TotalRequests  int
-	TotalReceived  int
-	TotalSent      int
-	TotalQueryTime int
-	AvgReq         int
-	AvgRecv        int
-	AvgSent        int
-	AvgQuery       int
+	Database              string
+	TotalXactCount        int
+	TotalQueryCount       int
+	TotalReceived         int
+	TotalSent             int
+	TotalXactTime         int
+	TotalQueryTime        int
+	TotalWaitTime         int
+	AvgXactCount          int
+	AvgQueryCount         int
+	AvgRecv               int
+	AvgSent               int
+	AvgXactTime           int
+	AvgQueryTime          int
+	AvgWaitTime           int
 }
 
 func unwrapNullString(in sql.NullString) *string {
@@ -145,9 +170,10 @@ func getConfigs(ctx context.Context, db *sql.DB) ([]Config, error) {
 	for rows.Next() {
 		var config Config
 		var rawValue sql.NullString
+		var rawDefault sql.NullString
 		var rawChangeable string
 
-		if err := rows.Scan(&config.Key, &rawValue, &rawChangeable); err != nil {
+		if err := rows.Scan(&config.Key, &rawValue, &rawDefault, &rawChangeable); err != nil {
 			return nil, errors.Wrap(err, "Failed to fetch row from results")
 		}
 		config.Changeable = rawChangeable == "yes"
@@ -178,10 +204,13 @@ func getDatabases(ctx context.Context, db *sql.DB) ([]Database, error) {
 			&database.Database,
 			&rawForceUser,
 			&database.PoolSize,
+			&database.MinPoolSize,
 			&database.ReservePool,
 			&rawPoolMode,
 			&database.MaxConnections,
 			&database.CurrentConnections,
+			&database.Paused,
+			&database.Disabled,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "Failed to fetch row from results")
@@ -210,12 +239,17 @@ func getPools(ctx context.Context, db *sql.DB) ([]Pool, error) {
 			&pool.User,
 			&pool.ClActive,
 			&pool.ClWaiting,
+			&pool.ClActiveCancelReq,
+			&pool.ClWaitingCancelReq,
 			&pool.SvActive,
+			&pool.SvActiveCancel,
+			&pool.SvBeingCanceled,
 			&pool.SvIdle,
 			&pool.SvUsed,
 			&pool.SvTested,
 			&pool.SvLogin,
 			&pool.MaxWait,
+			&pool.MaxwaitUs,
 			&pool.PoolMode,
 		)
 		if err != nil {
@@ -236,6 +270,7 @@ func getClients(ctx context.Context, db *sql.DB) ([]Client, error) {
 	var clients []Client
 	for rows.Next() {
 		var client Client
+		var rawApplicationName sql.NullString
 
 		err := rows.Scan(
 			&client.Type,
@@ -248,10 +283,15 @@ func getClients(ctx context.Context, db *sql.DB) ([]Client, error) {
 			&client.LocalPort,
 			&client.ConnectTime,
 			&client.RequestTime,
+			&client.Wait,
+			&client.WaitUs,
+			&client.CloseNeeded,
 			&client.Ptr,
 			&client.Link,
 			&client.RemotePid,
 			&client.TLS,
+			&rawApplicationName,
+			&client.PreparedStatements,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "Failed to fetch row from results")
@@ -271,6 +311,7 @@ func getServers(ctx context.Context, db *sql.DB) ([]Server, error) {
 	var servers []Server
 	for rows.Next() {
 		var server Server
+		var rawApplicationName sql.NullString
 
 		err := rows.Scan(
 			&server.Type,
@@ -283,10 +324,15 @@ func getServers(ctx context.Context, db *sql.DB) ([]Server, error) {
 			&server.LocalPort,
 			&server.ConnectTime,
 			&server.RequestTime,
+			&server.Wait,
+			&server.WaitUs,
+			&server.CloseNeeded,
 			&server.Ptr,
 			&server.Link,
 			&server.RemotePid,
 			&server.TLS,
+			&rawApplicationName,
+			&server.PreparedStatements,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "Failed to fetch row from results")
@@ -335,14 +381,20 @@ func getStats(ctx context.Context, db *sql.DB) ([]Stat, error) {
 
 		err := rows.Scan(
 			&stat.Database,
-			&stat.TotalRequests,
+			&stat.TotalXactCount,
+			&stat.TotalQueryCount,
 			&stat.TotalReceived,
 			&stat.TotalSent,
+			&stat.TotalXactTime,
 			&stat.TotalQueryTime,
-			&stat.AvgReq,
+			&stat.TotalWaitTime,
+			&stat.AvgXactCount,
+			&stat.AvgQueryCount,
 			&stat.AvgRecv,
 			&stat.AvgSent,
-			&stat.AvgQuery,
+			&stat.AvgXactTime,
+			&stat.AvgQueryTime,
+			&stat.AvgWaitTime,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "Failed to fetch row from results")
